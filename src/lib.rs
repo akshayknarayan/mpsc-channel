@@ -39,23 +39,25 @@ impl<T> Drop for Sender<T> {
 
         let g = self.mpsc_queue.enq_deq_time_hist.lock().unwrap();
         println!(
-            "mpsc_channel enq->deq time (ns): p5 = {}, p25 = {}, p50 = {}, p75 = {}, p95 = {}, cnt = {}",
+            "mpsc_channel enq->deq time (ns): p5 = {}, p25 = {}, p50 = {}, p75 = {}, p95 = {}, max = {}, cnt = {}",
             g.value_at_quantile(0.05),
             g.value_at_quantile(0.25),
             g.value_at_quantile(0.5),
             g.value_at_quantile(0.75),
             g.value_at_quantile(0.95),
+            g.max(),
             g.len(),
         );
 
         let g = self.mpsc_queue.inter_deq_time_hist.lock().unwrap();
         println!(
-            "mpsc_channel deq->deq time (ns): p5 = {}, p25 = {}, p50 = {}, p75 = {}, p95 = {}, cnt = {}",
+            "mpsc_channel deq->deq time (ns): p5 = {}, p25 = {}, p50 = {}, p75 = {}, p95 = {}, max = {}, cnt = {}",
             g.value_at_quantile(0.05),
             g.value_at_quantile(0.25),
             g.value_at_quantile(0.5),
             g.value_at_quantile(0.75),
             g.value_at_quantile(0.95),
+            g.max(),
             g.len(),
         );
     }
@@ -193,11 +195,11 @@ impl<T> MpscQueue<T> {
             enq_to_deq_time: Default::default(),
             clock: quanta::Clock::new(),
             enq_deq_time_hist: Arc::new(Mutex::new(
-                hdrhistogram::Histogram::new_with_max(100_000_000, 2).unwrap(),
+                hdrhistogram::Histogram::new_with_max(200_000_000, 2).unwrap(),
             )),
             last_deq_time: Default::default(),
             inter_deq_time_hist: Arc::new(Mutex::new(
-                hdrhistogram::Histogram::new_with_max(100_000_000, 2).unwrap(),
+                hdrhistogram::Histogram::new_with_max(200_000_000, 2).unwrap(),
             )),
         }
     }
