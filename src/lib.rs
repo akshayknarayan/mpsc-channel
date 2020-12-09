@@ -1,12 +1,14 @@
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
+use std::sync::Mutex;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc,
 };
 
 pub struct Sender<T> {
     mpsc_queue: Arc<MpscQueue<T>>,
+    enqueue_tries_hist: Arc<Mutex<hdrhistogram::Histogram<u32>>>,
 }
 
 // Need an explicit clone mechanism so that we can reference as appropriate
@@ -14,13 +16,48 @@ impl<T> Clone for Sender<T> {
     fn clone(&self) -> Sender<T> {
         let q = self.mpsc_queue.clone();
         q.reference_producers();
-        Sender { mpsc_queue: q }
+        Sender {
+            mpsc_queue: q,
+            enqueue_tries_hist: self.enqueue_tries_hist.clone(),
+        }
     }
 }
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         self.mpsc_queue.drop_producer();
+        let g = self.enqueue_tries_hist.lock().unwrap();
+        println!(
+            "mpsc_channel enqueue tries ctr: p5 = {}, p25 = {}, p50 = {}, p75 = {}, p95 = {}, cnt = {}",
+            g.value_at_quantile(0.05),
+            g.value_at_quantile(0.25),
+            g.value_at_quantile(0.5),
+            g.value_at_quantile(0.75),
+            g.value_at_quantile(0.95),
+            g.len(),
+        );
+
+        let g = self.mpsc_queue.enq_deq_time_hist.lock().unwrap();
+        println!(
+            "mpsc_channel enq->deq time (ns): p5 = {}, p25 = {}, p50 = {}, p75 = {}, p95 = {}, cnt = {}",
+            g.value_at_quantile(0.05),
+            g.value_at_quantile(0.25),
+            g.value_at_quantile(0.5),
+            g.value_at_quantile(0.75),
+            g.value_at_quantile(0.95),
+            g.len(),
+        );
+
+        let g = self.mpsc_queue.inter_deq_time_hist.lock().unwrap();
+        println!(
+            "mpsc_channel deq->deq time (ns): p5 = {}, p25 = {}, p50 = {}, p75 = {}, p95 = {}, cnt = {}",
+            g.value_at_quantile(0.05),
+            g.value_at_quantile(0.25),
+            g.value_at_quantile(0.5),
+            g.value_at_quantile(0.75),
+            g.value_at_quantile(0.95),
+            g.len(),
+        );
     }
 }
 
@@ -36,6 +73,7 @@ impl<T> Sender<T> {
     #[inline]
     pub fn enqueue_wait(&self, msg: T) {
         let mut m = Some(msg);
+        let mut enq_tries_ctr = 0;
         loop {
             match self.mpsc_queue.enqueue(m.take().unwrap()) {
                 Ok(_) => break,
@@ -43,8 +81,24 @@ impl<T> Sender<T> {
             }
 
             //std::thread::sleep(std::time::Duration::from_micros(1));
-            std::thread::yield_now();
+            //std::thread::yield_now();
+            enq_tries_ctr += 1;
         }
+
+        self.enqueue_tries_hist
+            .lock()
+            .unwrap()
+            .saturating_record(enq_tries_ctr as _);
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.mpsc_queue.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -65,6 +119,16 @@ impl<T> Receiver<T> {
             Ok(&ents[..num])
         }
     }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.mpsc_queue.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 pub enum ReceiverError {
@@ -77,6 +141,9 @@ pub fn new_mpsc_queue_pair_with_size<T>(size: usize) -> (Sender<T>, Receiver<T>)
     (
         Sender {
             mpsc_queue: mpsc_q.clone(),
+            enqueue_tries_hist: Arc::new(Mutex::new(
+                hdrhistogram::Histogram::new_with_max(100, 2).unwrap(),
+            )),
         },
         Receiver { mpsc_queue: mpsc_q },
     )
@@ -99,6 +166,11 @@ struct MpscQueue<T> {
     consumer: QueueMetadata,
     queue: Vec<UnsafeCell<MaybeUninit<T>>>,
     n_producers: AtomicUsize, // Number of consumers.
+    enq_to_deq_time: AtomicU64,
+    last_deq_time: AtomicU64,
+    clock: quanta::Clock,
+    enq_deq_time_hist: Arc<Mutex<hdrhistogram::Histogram<u32>>>,
+    inter_deq_time_hist: Arc<Mutex<hdrhistogram::Histogram<u32>>>,
 }
 
 impl<T> MpscQueue<T> {
@@ -118,7 +190,28 @@ impl<T> MpscQueue<T> {
             producer: Default::default(),
             consumer: Default::default(),
             n_producers: Default::default(),
+            enq_to_deq_time: Default::default(),
+            clock: quanta::Clock::new(),
+            enq_deq_time_hist: Arc::new(Mutex::new(
+                hdrhistogram::Histogram::new_with_max(100_000_000, 2).unwrap(),
+            )),
+            last_deq_time: Default::default(),
+            inter_deq_time_hist: Arc::new(Mutex::new(
+                hdrhistogram::Histogram::new_with_max(100_000_000, 2).unwrap(),
+            )),
         }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        let producer_head = self.producer.head.load(Ordering::Acquire);
+        let consumer_tail = self.consumer.tail.load(Ordering::Acquire);
+
+        let free = self
+            .mask
+            .wrapping_add(consumer_tail)
+            .wrapping_sub(producer_head);
+        self.slots - free
     }
 
     // This assumes that no producers are currently active.
@@ -136,6 +229,16 @@ impl<T> MpscQueue<T> {
     pub fn enqueue(&self, ent: T) -> Result<(), T> {
         let producers = self.n_producers.load(Ordering::Acquire);
         assert!(producers >= 1, "Insertion into a queue without producers");
+        assert!(producers == 1);
+
+        // a store here measures most recent enqueue until dequeue
+        self.enq_to_deq_time
+            .store(self.clock.start(), Ordering::SeqCst);
+
+        // CAS measures the first enqueue until dequeue
+        //self.enq_to_deq_time
+        //    .compare_and_swap(0, self.clock.start(), Ordering::SeqCst);
+
         if producers == 1 {
             self.enqueue_sp(ent)
         } else {
@@ -219,8 +322,10 @@ impl<T> MpscQueue<T> {
             unsafe {
                 self.enqueue_ents(producer_head, ent);
             }
+
             // Commit write by changing tail.
-            // Before committing we wait for any preceding writes to finish (this is important since we assume buffer is
+            // Before committing we wait for any preceding writes to finish
+            // This is important since we assume buffer is
             // always available upto commit point.
             while {
                 let producer_tail = self.producer.tail.load(Ordering::Acquire);
@@ -228,7 +333,9 @@ impl<T> MpscQueue<T> {
             } {
                 //pause(); // Pausing is a nice thing to do during spin locks
             }
-            // Once this has been achieved, update tail. Any conflicting updates will wait on the previous spin lock.
+
+            // Once this has been achieved, update tail.
+            // Any conflicting updates will wait on the previous spin lock.
             self.producer.tail.store(end, Ordering::Release);
             Ok(())
         } else {
@@ -251,6 +358,23 @@ impl<T> MpscQueue<T> {
 
     #[inline]
     pub fn dequeue(&self, ents: &mut [T]) -> usize {
+        let end = self.clock.end();
+        let start = self.enq_to_deq_time.swap(0, Ordering::SeqCst);
+        if start != 0 {
+            let dur = self.clock.delta(start, end);
+            self.enq_deq_time_hist
+                .lock()
+                .unwrap()
+                .saturating_record(dur.as_nanos() as _);
+        }
+
+        let last_end = self.last_deq_time.swap(end, Ordering::SeqCst);
+        let dur = self.clock.delta(last_end, end);
+        self.inter_deq_time_hist
+            .lock()
+            .unwrap()
+            .saturating_record(dur.as_nanos() as _);
+
         // NOTE: This is a single consumer dequeue as assumed by this queue.
         let consumer_head = self.consumer.head.load(Ordering::Acquire);
         let producer_tail = self.producer.tail.load(Ordering::Acquire);
